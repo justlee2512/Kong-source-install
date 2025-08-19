@@ -1,0 +1,137 @@
+# docker-compose.yml (Compose V2 – bỏ "version")
+
+services:
+  # === Postgres cho KONG (ổn định) ===
+  db:
+    image: postgres:14
+    platform: linux/arm64/v8      # nếu máy x86_64 thì bỏ dòng này
+    container_name: kong-postgres
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kongpass
+      POSTGRES_INITDB_ARGS: "--auth=md5"
+    volumes:
+      - kong_data:/var/lib/postgresql/data
+      - ./init/01-init_kong.sql:/docker-entrypoint-initdb.d/01-init_kong.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kong -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [kong-net]
+    restart: unless-stopped
+
+  kong-migrations:
+    image: kong:3.7
+    platform: linux/arm64/v8
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: db
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpass
+      KONG_PG_DATABASE: kong
+    command: ["sh", "-lc", "kong migrations bootstrap -v || kong migrations up -v"]
+    networks: [kong-net]
+
+  kong:
+    image: kong:3.7
+    platform: linux/arm64/v8
+    container_name: kong
+    depends_on:
+      db:
+        condition: service_healthy
+      kong-migrations:
+        condition: service_completed_successfully
+    environment:
+      KONG_DATABASE: postgres
+      KONG_PG_HOST: db
+      KONG_PG_USER: kong
+      KONG_PG_PASSWORD: kongpass
+      KONG_PG_DATABASE: kong
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001, 0.0.0.0:8444 ssl
+    ports:
+      - "8000:8000"   # Proxy HTTP
+      - "8443:8443"   # Proxy HTTPS
+      - "8001:8001"   # Admin API HTTP
+      - "8444:8444"   # Admin API HTTPS
+    networks: [kong-net]
+    restart: unless-stopped
+
+  # === MariaDB riêng cho KONGA (tránh vấn đề SSL/SCRAM) ===
+  db-konga:
+    image: mariadb:10.6
+    platform: linux/arm64/v8      # nếu máy x86_64 thì bỏ dòng này
+    container_name: konga-mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: konga
+      MYSQL_USER: konga
+      MYSQL_PASSWORD: kongapass
+    volumes:
+      - konga_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -u root -prootpass --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [kong-net]
+    restart: unless-stopped
+
+  konga-prepare:
+    image: pantsel/konga:next
+    platform: linux/amd64          # image Konga chủ yếu amd64 → emulation trên ARM
+    depends_on:
+      db-konga:
+        condition: service_healthy
+    environment:
+      DB_ADAPTER: mysql
+      DB_HOST: db-konga
+      DB_PORT: "3306"
+      DB_USER: konga
+      DB_PASSWORD: kongapass
+      DB_DATABASE: konga
+      NODE_ENV: production
+    command: >
+      -c prepare
+      -a mysql
+      -u mysql://konga:kongapass@db-konga:3306/konga
+    networks: [kong-net]
+
+  konga:
+    image: pantsel/konga:next
+    platform: linux/amd64
+    container_name: konga
+    environment:
+      DB_ADAPTER: mysql
+      DB_HOST: db-konga
+      DB_PORT: "3306"
+      DB_USER: konga
+      DB_PASSWORD: kongapass
+      DB_DATABASE: konga
+      NODE_ENV: production
+    depends_on:
+      db-konga:
+        condition: service_healthy
+      konga-prepare:
+        condition: service_completed_successfully
+      kong:
+        condition: service_started
+    ports:
+      - "1337:1337"
+    networks: [kong-net]
+    restart: unless-stopped
+
+networks:
+  kong-net:
+    driver: bridge
+
+volumes:
+  kong_data:
+  konga_data:
